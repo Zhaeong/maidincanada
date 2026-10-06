@@ -1,4 +1,4 @@
-/* pixelizer.c -- load a JPEG, pixelize it, write a 640x480 24-bit BMP.
+/* pixelizer.c -- load a JPEG, pixelize it, write a 24-bit BMP.
  *
  * Strict C89, compiled with MSVC /Za, and depending on nothing beyond
  * the C standard library.  This includes a self-contained baseline
@@ -10,7 +10,12 @@
  * compile in strict ANSI C89 mode (they use anonymous unions, which are
  * a C11 feature), so the system WIC decoder is not usable under /Za.
  *
- * usage: pixelizer <input.jpg> [output.bmp]
+ * usage: pixelizer <input.jpg> [output.bmp] [-a W:H | ratio] [-p N] [-d]
+ *   -a  output aspect ratio, e.g. -a 16:9, -a 1:1, or -a 1.7778;
+ *       the canvas is the largest block-aligned rectangle of that
+ *       aspect fitting inside 640x480 (default 4:3 = 640x480)
+ *   -p  pixel (block) size in output pixels, 1..480; default 8
+ *   -d  also dump the decoded source image as decoded.bmp
  */
 
 #define _CRT_SECURE_NO_WARNINGS /* fopen is C89; fopen_s is not */
@@ -20,12 +25,9 @@
 #include <string.h>
 #include <math.h>
 
-#define OUT_W   640             /* output width                    */
-#define OUT_H   480             /* output height                   */
-#define BLOCK   8               /* output "pixel" size             */
-#define GRID_W  (OUT_W / BLOCK) /* effective grid: 80 x 60         */
-#define GRID_H  (OUT_H / BLOCK)
-#define BPP     3               /* 24bpp BGR                       */
+#define MAX_W   640             /* canvas width bound               */
+#define MAX_H   480             /* canvas height bound (max block) */
+#define BPP     3               /* 24bpp BGR                        */
 
 #define JPEG_PI 3.14159265358979323846
 
@@ -631,38 +633,127 @@ static unsigned char *read_file(const char *path, long *out_size)
 /* Pixelization                                                       */
 /* ------------------------------------------------------------------ */
 
-/* Average the source onto a GRID_W x GRID_H grid (aspect-preserving,
- * letterboxed with black), then replicate each cell to BLOCK x BLOCK
- * output pixels.  Returns a top-down 24bpp BGR buffer, OUT_W x OUT_H. */
+/* Parse an aspect ratio: "W:H" (e.g. 16:9) or a plain number (e.g. 1.7778). */
+static double parse_ratio(const char *s)
+{
+    const char *colon;
+    char buf[64];
+    char *end;
+    double num, den;
+    size_t n;
 
-static unsigned char *pixelize(const unsigned char *src, int sw, int sh)
+    colon = strchr(s, ':');
+    if (colon == NULL) {
+        num = strtod(s, &end);
+        if (end == s || *end != '\0' || num <= 0.0)
+            fatal("bad aspect ratio (use W:H or a number, e.g. 16:9)");
+        return num;
+    }
+    n = (size_t)(colon - s);
+    if (n == 0 || n >= sizeof(buf))
+        fatal("bad aspect ratio (use W:H, e.g. 16:9)");
+    memcpy(buf, s, n);
+    buf[n] = '\0';
+    num = strtod(buf, &end);
+    if (end == buf || *end != '\0' || num <= 0.0)
+        fatal("bad aspect ratio (use W:H, e.g. 16:9)");
+    den = strtod(colon + 1, &end);
+    if (end == colon + 1 || *end != '\0' || den <= 0.0)
+        fatal("bad aspect ratio (use W:H, e.g. 16:9)");
+    return num / den;
+}
+
+/* Snap a positive length to the nearest multiple of block (min block). */
+static int snap_block(double v, int block)
+{
+    long n;
+
+    n = (long)(v / (double)block + 0.5);
+    if (n < 1)
+        n = 1;
+    return (int)(n * block);
+}
+
+/* Largest block-aligned canvas of the given aspect ratio that fits
+ * inside MAX_W x MAX_H.  With block 8 and ratio 4:3 this is 640x480. */
+static void canvas_for_ratio(double ratio, int block, int *cw, int *ch)
+{
+    int wcap, hcap;
+    double w, h;
+
+    wcap = (MAX_W / block) * block;
+    hcap = (MAX_H / block) * block;
+    if (ratio >= (double)wcap / (double)hcap) {
+        w = (double)wcap;
+        h = w / ratio;
+        if (h > (double)hcap)
+            h = (double)hcap;
+    } else {
+        h = (double)hcap;
+        w = h * ratio;
+        if (w > (double)wcap)
+            w = (double)wcap;
+    }
+    *cw = snap_block(w, block);
+    *ch = snap_block(h, block);
+    if (*cw > wcap)
+        *cw = wcap;
+    if (*ch > hcap)
+        *ch = hcap;
+}
+
+/* Parse the pixel (block) size: an integer from 1 to MAX_H.  The block
+ * must not exceed MAX_H so a whole block always fits the canvas. */
+static int parse_block(const char *s)
+{
+    char *end;
+    long v;
+
+    v = strtol(s, &end, 10);
+    if (end == s || *end != '\0' || v < 1 || v > MAX_H)
+        fatal("pixel size must be an integer from 1 to 480");
+    return (int)v;
+}
+
+/* Average the source onto a gw x gh grid of block-sized cells covering
+ * the cw x ch canvas (aspect-preserving, letterboxed with black),
+ * then replicate each cell to block x block output pixels.  Returns
+ * a top-down 24bpp BGR buffer, cw x ch. */
+
+static unsigned char *pixelize(const unsigned char *src, int sw, int sh,
+                                int cw, int ch, int block)
 {
     unsigned char *dst;
-    long gw, gh, gox, goy;
-    long cx, cy, ch, i, j;
+    long grid_w, grid_h, gw, gh, gox, goy;
+    long cx, cy, c, i, j;
 
-    dst = (unsigned char *)xmalloc((size_t)OUT_W * (size_t)OUT_H * BPP);
+    dst = (unsigned char *)xmalloc((size_t)cw * (size_t)ch * (size_t)BPP);
 
-    /* fitted image size, snapped to whole blocks */
-    if ((double)sw / (double)sh > (double)OUT_W / (double)OUT_H) {
-        gw = OUT_W / BLOCK;
-        gh = (long)((double)OUT_W * (double)sh / (double)sw / BLOCK + 0.5);
+    grid_w = cw / block;
+    grid_h = ch / block;
+
+    /* fitted image size in cells, snapped to whole cells */
+    if ((double)sw / (double)sh > (double)cw / (double)ch) {
+        gw = grid_w;
+        gh = (long)((double)cw * (double)sh / (double)sw / (double)block + 0.5);
     } else {
-        gh = OUT_H / BLOCK;
-        gw = (long)((double)OUT_H * (double)sw / (double)sh / BLOCK + 0.5);
+        gh = grid_h;
+        gw = (long)((double)ch * (double)sw / (double)sh / (double)block + 0.5);
     }
     if (gw < 1) gw = 1;
     if (gh < 1) gh = 1;
-    gox = (GRID_W - gw) / 2;     /* letterbox offsets in grid cells */
-    goy = (GRID_H - gh) / 2;
+    if (gw > grid_w) gw = grid_w;
+    if (gh > grid_h) gh = grid_h;
+    gox = (grid_w - gw) / 2;     /* letterbox offsets in grid cells */
+    goy = (grid_h - gh) / 2;
 
-    for (cy = 0; cy < GRID_H; cy++) {
-        for (cx = 0; cx < GRID_W; cx++) {
+    for (cy = 0; cy < grid_h; cy++) {
+        for (cx = 0; cx < grid_w; cx++) {
             unsigned char color[BPP];
 
             if (cx < gox || cx >= gox + gw || cy < goy || cy >= goy + gh) {
-                for (ch = 0; ch < BPP; ch++)
-                    color[ch] = 0;              /* letterbox: black */
+                for (c = 0; c < BPP; c++)
+                    color[c] = 0;              /* letterbox: black */
             } else {
                 unsigned long sum[BPP];
                 unsigned long n;
@@ -681,29 +772,29 @@ static unsigned char *pixelize(const unsigned char *src, int sw, int sh)
                 if (sy1 > (long)sh) sy1 = (long)sh;
 
                 n = (unsigned long)(sx1 - sx0) * (unsigned long)(sy1 - sy0);
-                for (ch = 0; ch < BPP; ch++)
-                    sum[ch] = 0;
+                for (c = 0; c < BPP; c++)
+                    sum[c] = 0;
                 for (j = sy0; j < sy1; j++) {
-                    row = src + ((size_t)j * (size_t)sw + (size_t)sx0) * BPP;
+                    row = src + ((size_t)j * (size_t)sw + (size_t)sx0) * (size_t)BPP;
                     for (i = sx0; i < sx1; i++) {
-                        for (ch = 0; ch < BPP; ch++)
-                            sum[ch] += row[ch];
+                        for (c = 0; c < BPP; c++)
+                            sum[c] += row[c];
                         row += BPP;
                     }
                 }
-                for (ch = 0; ch < BPP; ch++)
-                    color[ch] = (unsigned char)(sum[ch] / n);
+                for (c = 0; c < BPP; c++)
+                    color[c] = (unsigned char)(sum[c] / n);
             }
 
-            /* stamp the BLOCK x BLOCK cell */
-            for (j = 0; j < BLOCK; j++) {
+            /* stamp the block x block cell */
+            for (j = 0; j < block; j++) {
                 unsigned char *out;
 
-                out = dst + (((size_t)(cy * BLOCK + j) * (size_t)OUT_W) +
-                             (size_t)(cx * BLOCK)) * (size_t)BPP;
-                for (i = 0; i < BLOCK; i++) {
-                    for (ch = 0; ch < BPP; ch++)
-                        out[ch] = color[ch];
+                out = dst + (((size_t)(cy * (long)block + j) * (size_t)cw) +
+                             (size_t)(cx * (long)block)) * (size_t)BPP;
+                for (i = 0; i < block; i++) {
+                    for (c = 0; c < BPP; c++)
+                        out[c] = color[c];
                     out += BPP;
                 }
             }
@@ -770,37 +861,74 @@ static void write_bmp(const char *path, const unsigned char *px, int w, int h)
 
 int main(int argc, char **argv)
 {
-    const char *in_path;
-    const char *out_path;
+    const char *in_path = NULL;
+    const char *out_path = NULL;
+    const char *ratio_s = NULL;
+    const char *block_s = NULL;
     unsigned char *jpg;
     unsigned char *src;
     unsigned char *out;
     long jpg_size;
     int sw, sh;
+    int cw, ch;
+    int debug = 0;
+    int i;
+    int block = 8;               /* default pixel size */
+    double ratio = (double)MAX_W / (double)MAX_H;   /* default 4:3 */
 
-    if (argc < 2) {
-        fprintf(stderr, "usage: pixelizer <input.jpg> [output.bmp]\n");
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-a") == 0) {
+            if (i + 1 >= argc)
+                fatal("option -a needs an aspect ratio, e.g. -a 16:9");
+            ratio_s = argv[++i];
+        } else if (strcmp(argv[i], "-p") == 0) {
+            if (i + 1 >= argc)
+                fatal("option -p needs a pixel size, e.g. -p 16");
+            block_s = argv[++i];
+        } else if (strcmp(argv[i], "-d") == 0) {
+            debug = 1;
+        } else if (in_path == NULL) {
+            in_path = argv[i];
+        } else if (out_path == NULL) {
+            out_path = argv[i];
+        } else {
+            fatal("too many arguments");
+        }
+    }
+    if (in_path == NULL) {
+        fprintf(stderr,
+                "usage: pixelizer <input.jpg> [output.bmp]"
+                " [-a W:H | ratio] [-p N] [-d]\n"
+                "  -a  output aspect ratio (e.g. 16:9, 4:3, 1:1, 1.7778);\n"
+                "      default 4:3; canvas fits inside 640x480\n"
+                "  -p  pixel (block) size in output pixels, 1..480; default 8\n"
+                "  -d  also dump the decoded source image as decoded.bmp\n");
         return EXIT_FAILURE;
     }
-    in_path = argv[1];
-    out_path = (argc > 2) ? argv[2] : "pixelized.bmp";
+    if (out_path == NULL)
+        out_path = "pixelized.bmp";
+    if (ratio_s != NULL)
+        ratio = parse_ratio(ratio_s);
+    if (block_s != NULL)
+        block = parse_block(block_s);
+    canvas_for_ratio(ratio, block, &cw, &ch);
 
     init_tables();
     jpg = read_file(in_path, &jpg_size);
     src = jpeg_decode(jpg, jpg_size, &sw, &sh);
     free(jpg);
 
-    out = pixelize(src, sw, sh);
+    out = pixelize(src, sw, sh, cw, ch, block);
 
-    if (argc > 3 && strcmp(argv[3], "-d") == 0)
+    if (debug)
         write_bmp("decoded.bmp", src, sw, sh);
     free(src);
 
-    write_bmp(out_path, out, OUT_W, OUT_H);
+    write_bmp(out_path, out, cw, ch);
     free(out);
 
     printf("%s: %dx%d -> %dx%d grid (block %dx%d) -> %s (%dx%d)\n",
-           in_path, sw, sh, GRID_W, GRID_H, BLOCK, BLOCK,
-           out_path, OUT_W, OUT_H);
+           in_path, sw, sh, cw / block, ch / block, block, block,
+           out_path, cw, ch);
     return 0;
 }
