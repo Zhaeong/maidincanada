@@ -4,6 +4,8 @@ A minimal C program compiled to WebAssembly with Emscripten. It uses SDL2
 (bundled with Emscripten via `-sUSE_SDL=2`) to draw a blue square centered
 on a 512×512 canvas.
 
+See live at: https://zhaeong.github.io/maidincanada/
+
 ## Layout
 
 - `src/main.c` — the C source. Creates a 512×512 SDL window (mapped to the
