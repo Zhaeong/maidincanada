@@ -13,8 +13,24 @@ on a 512×512 canvas.
 
 ## Build
 
+First need to install emsdk:
+
+```
+python first needs to be installed (e.g. use miniforge)
+git clone https://github.com/emscripten-core/emsdk.git
+cd emsdk
+.\emsdk install latest
+.\emsdk activate latest
+The can activate for later use:
+emsdk_env.bat
+```
+Afterwards the build.bat script should handle all that:
 ```
 build.bat
+
+Which does:
+emcc src\main.c -O2 -o out\index.html -sUSE_SDL=2
+
 ```
 
 ## Run
